@@ -36,6 +36,9 @@ pub enum MenuAction {
     SetZoneEffectKind(u8, String),
     /// Set one lighting zone's color (zone = a `razer_proto::led` id).
     SetZoneColor(u8, Rgb),
+    /// Stage one on-board bind from the settings window (keymap button id,
+    /// bind text; blank = drop the entry) and write it to the mouse if valid.
+    SetOnboard(u8, String),
     Save,
     OpenSettings,
     SettingsClosed,
@@ -195,6 +198,7 @@ fn to_platform_diagram(d: &razer_proto::diagram::Diagram) -> platform::diagram::
                     rd::CalloutSlot::ThumbForward => pd::CalloutSlot::ThumbForward,
                     rd::CalloutSlot::Wheel => pd::CalloutSlot::Wheel,
                     rd::CalloutSlot::Lighting(z) => pd::CalloutSlot::Lighting(z),
+                    rd::CalloutSlot::Button(b) => pd::CalloutSlot::Button(b),
                 };
                 // The window's dropdowns are self-identifying (index 0 names
                 // the button — see combo_options), so the callout captions
@@ -215,12 +219,23 @@ fn to_platform_diagram(d: &razer_proto::diagram::Diagram) -> platform::diagram::
     pd::Diagram { shapes }
 }
 
+/// "wheel click" -> "Wheel click", the caption of an on-board bind field.
+fn onboard_label(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 /// Spawn the settings window on its own thread (message loop lives there).
 /// `spec` supplies the plugged-in device's identity and capabilities: the
 /// slider covers the whole DPI range of *that* mouse (16000 on the Elite,
 /// 30000 on the V3), its schematic fills the side pane, and the DPI-button
 /// / lighting control groups only exist when the hardware does.
-fn open_settings_window(cfg: &Config, spec: DeviceSpec, tx: &Sender<Event>) {
+fn open_settings_window(
+    cfg: &Config,
+    spec: DeviceSpec,
+    stored: &[crate::onboard::StoredBind],
+    tx: &Sender<Event>,
+) {
     use platform::settings::ActionCombo;
     // Each dropdown's index-0 entry is its button's identity (mapping to
     // config "none"); the thumb entries say "(default)" — no hook, native
@@ -250,6 +265,20 @@ fn open_settings_window(cfg: &Config, spec: DeviceSpec, tx: &Sender<Event>) {
             }
         })
         .collect();
+    // On-board bind controls exist only for mice with a recorded keymap: one
+    // per writable button, mounted at its CalloutSlot::Button on the diagram
+    // and opening on its [onboard] entry. They replace the thumb dropdowns.
+    let onboard = razer_proto::keymap::spec_for(spec.product_id).map(|km| {
+        crate::onboard::controls(km, &cfg.onboard, stored)
+            .into_iter()
+            .map(|c| platform::settings::OnboardButton {
+                id: c.button,
+                label: onboard_label(c.name),
+                presets: c.presets,
+                text: c.text,
+            })
+            .collect()
+    });
     let init = platform::settings::SettingsInit {
         device_name: spec.name.to_string(),
         diagram: spec.diagram.as_ref().map(to_platform_diagram),
@@ -268,6 +297,7 @@ fn open_settings_window(cfg: &Config, spec: DeviceSpec, tx: &Sender<Event>) {
         // entry, mounted disabled by the window. No config key, no events.
         wheel: ActionCombo { labels: vec!["Middle click (default)".to_string()], index: 0 },
         lighting,
+        onboard,
     };
     let tx = tx.clone();
     thread::spawn(move || {
@@ -317,6 +347,10 @@ fn open_settings_window(cfg: &Config, spec: DeviceSpec, tx: &Sender<Event>) {
                     .rgb_zones
                     .get(zi)
                     .map(|&zone| MenuAction::SetZoneColor(zone, Rgb::new(r, g, b))),
+                SE::Onboard(button, text) => Some(MenuAction::SetOnboard(
+                    button,
+                    crate::onboard::choice_to_bind(button, &text),
+                )),
                 SE::Save => Some(MenuAction::Save),
             };
             if let Some(c) = cmd {
@@ -835,6 +869,9 @@ fn run_session(
     // devices without lighting hardware — see `apply_startup_lighting`).
     apply_startup_lighting(&ctrl, cfg, log);
 
+    migrate_thumb_remaps(&ctrl, cfg, bindings, log);
+    check_onboard_binds(&ctrl, cfg, log);
+
     // Driver mode and the DPI-button vendor-code listeners only apply to devices
     // that actually have the wheel DPI buttons. On a device without them there
     // is nothing to switch into driver mode for and nothing to listen for, so we
@@ -916,7 +953,18 @@ fn run_session(
                     log.log("Settings already open; brought to foreground.");
                 } else {
                     *settings_open = true;
-                    open_settings_window(cfg, spec, tx);
+                    // The on-board controls open on what the mouse stores, so
+                    // a leftover bind shows as itself (a failed read falls
+                    // back to the config alone).
+                    let stored = razer_proto::keymap::spec_for(spec.product_id)
+                        .map(|km| crate::onboard::read_binds(&ctrl, km))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            log.log(&format!("WARN could not read on-board binds for settings: {e}"));
+                            None
+                        })
+                        .unwrap_or_default();
+                    open_settings_window(cfg, spec, &stored, tx);
                     log.log("Opened settings window.");
                 }
             }
@@ -959,6 +1007,122 @@ fn run_session(
             log.log(&format!("WARN could not refresh PC Vitals capsule: {error}"));
         }
     }
+}
+
+/// Write the `[onboard]` binds the config asks for (only the ones that differ)
+/// and return the buttons it configures. A bad config or a failed write is
+/// logged, not fatal; a bad config configures nothing.
+fn write_onboard_config(
+    ctrl: &Mouse,
+    km: &'static razer_proto::keymap::KeymapSpec,
+    cfg: &Config,
+    log: &Logger,
+) -> Vec<u8> {
+    use crate::onboard;
+    let wanted = match onboard::parse_config(km, &cfg.onboard) {
+        Ok(w) => w,
+        Err(e) => {
+            log.log(&format!("WARN [onboard] not applied: {e}"));
+            Vec::new()
+        }
+    };
+    match onboard::apply(ctrl, km, &wanted) {
+        Ok(changes) => {
+            for c in changes {
+                log.log(&format!("On-board bind written: {c}"));
+            }
+        }
+        Err(e) => log.log(&format!("WARN could not write [onboard] binds: {e}")),
+    }
+    wanted.iter().map(|w| w.button).collect()
+}
+
+/// On a mouse that stores binds, the settings window has no software thumb
+/// dropdowns, so a `thumb_back`/`thumb_forward` remap would run unseen: move it
+/// into `[onboard]` (see `onboard::migrate_thumbs`), save, and drop the hook.
+fn migrate_thumb_remaps(ctrl: &Mouse, cfg: &mut Config, bindings: &mut Bindings, log: &Logger) {
+    let Some(km) = razer_proto::keymap::spec_for(ctrl.spec().product_id) else {
+        return;
+    };
+    let notes = crate::onboard::migrate_thumbs(km, cfg);
+    if notes.is_empty() {
+        return;
+    }
+    for n in &notes {
+        log.log(&format!("Config: {n}."));
+    }
+    save_config(cfg, log);
+    *bindings = Bindings::from_config(cfg, log);
+    apply_thumb_hook(cfg, log);
+}
+
+/// Once per attach: write the `[onboard]` binds the config asks for (only the
+/// ones that differ), then read the rest and, if any are non-default leftovers,
+/// log them and offer to reset them. A failure (e.g. Synapse streaming lighting
+/// commands and tripping an echo mismatch) is only logged. The notice runs on a
+/// throwaway thread and is shown once per distinct set of leftovers per run.
+fn check_onboard_binds(ctrl: &Mouse, cfg: &Config, log: &Logger) {
+    use crate::onboard;
+    let spec = ctrl.spec();
+    let Some(km) = razer_proto::keymap::spec_for(spec.product_id) else {
+        if !cfg.onboard.is_empty() {
+            log.log(&format!("WARN [onboard] ignored: on-board binds aren't supported on the {}", spec.name));
+        }
+        return;
+    };
+    let configured = write_onboard_config(ctrl, km, cfg, log);
+    let binds = match onboard::read_binds(ctrl, km) {
+        Ok(b) => b,
+        Err(e) => {
+            log.log(&format!("WARN could not read on-board binds: {e}"));
+            return;
+        }
+    };
+    let left = onboard::leftovers(&binds, &configured);
+    if left.is_empty() {
+        log.log("On-board binds match the config and factory defaults.");
+        return;
+    }
+    let described = onboard::describe(&left);
+    log.log(&format!("WARN non-default binds stored on the mouse: {described}."));
+    if onboard::first_time(&described) {
+        let text = onboard::notice_text(spec.name, &described);
+        let log = log.clone();
+        thread::spawn(move || {
+            if platform::alert_yes_no("Snakecharmer", &text) {
+                reset_leftovers(km, &configured, &log);
+            }
+        });
+    }
+}
+
+/// The "reset them now?" answer. Runs on the notice's thread with its own
+/// handle; a clash with the session's periodic reassert fails a read-back,
+/// which is reported rather than retried.
+fn reset_leftovers(km: &'static razer_proto::keymap::KeymapSpec, configured: &[u8], log: &Logger) {
+    use crate::onboard;
+    let result = Mouse::open()
+        .and_then(|m| onboard::reset(&m, km, configured));
+    let message = match result {
+        Ok(out) => {
+            for c in &out.changes {
+                log.log(&format!("On-board bind reset: {c}"));
+            }
+            let mut m = format!("Reset {} button(s) to the factory bind.", out.changes.len());
+            if !out.stuck.is_empty() {
+                m += &format!(
+                    "\n\nCan't reset {} yet: no recorded write for that button.",
+                    out.stuck.join(", ")
+                );
+            }
+            m
+        }
+        Err(e) => {
+            log.log(&format!("WARN on-board reset failed: {e}"));
+            format!("The reset didn't complete: {e}\n\nTry again with `charmctl keymap reset`.")
+        }
+    };
+    platform::alert("Snakecharmer", &message);
 }
 
 fn apply_startup_lighting(ctrl: &Mouse, cfg: &Config, log: &Logger) {
@@ -1109,6 +1273,37 @@ fn handle_menu(
             save_config(cfg, log);
             log.log(&format!("Settings: {name} color -> {hex}."));
         }
+        MenuAction::SetOnboard(button, value) => {
+            // A rejected entry is reported and never stored; a failed write
+            // keeps the (valid) entry so the next attach retries it.
+            let spec = ctrl.spec();
+            let Some(km) = razer_proto::keymap::spec_for(spec.product_id) else {
+                return Ok(false);
+            };
+            let Some(&(_, name)) = km.buttons.iter().find(|(b, _)| *b == button) else {
+                return Ok(false);
+            };
+            let problem = match crate::onboard::set_entry(km, &mut cfg.onboard, name, &value) {
+                Ok(None) => {
+                    log.log(&format!("Settings: on-board {name} left alone."));
+                    None
+                }
+                Ok(Some(w)) => match crate::onboard::apply(ctrl, km, &[w]) {
+                    Ok(changes) => {
+                        for c in changes {
+                            log.log(&format!("On-board bind written: {c}"));
+                        }
+                        None
+                    }
+                    Err(e) => Some(format!("Couldn't write the {name} bind to the mouse: {e}")),
+                },
+                Err(e) => Some(format!("The {name} bind wasn't saved: {e}")),
+            };
+            if let Some(text) = problem {
+                log.log(&format!("WARN {text}"));
+                thread::spawn(move || platform::alert("Snakecharmer", &text));
+            }
+        }
         MenuAction::Save => {
             save_config(cfg, log);
             log.log("Settings: config saved.");
@@ -1130,6 +1325,7 @@ fn handle_menu(
                 log.log(&n);
             }
             *cfg = new_cfg;
+            migrate_thumb_remaps(ctrl, cfg, bindings, log);
             *bindings = Bindings::from_config(cfg, log);
             let (dx, dy) = cfg.dpi_xy();
             let _ = ctrl.set_dpi(dx, dy);
@@ -1138,6 +1334,9 @@ fn handle_menu(
             }
             apply_startup_lighting(ctrl, cfg, log);
             apply_thumb_hook(cfg, log);
+            if let Some(km) = razer_proto::keymap::spec_for(ctrl.spec().product_id) {
+                write_onboard_config(ctrl, km, cfg, log);
+            }
             log.log("Menu: config reloaded and reapplied.");
         }
         MenuAction::Quit => return Ok(true),
@@ -1241,6 +1440,12 @@ fn reassert(ctrl: &Mouse, cfg: &Config, log: &Logger) -> Result<(), razer_hid::E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboard_labels_capitalize_the_button_name() {
+        assert_eq!(onboard_label("wheel click"), "Wheel click");
+        assert_eq!(onboard_label(""), "");
+    }
 
     #[test]
     fn all_action_presets_parse() {

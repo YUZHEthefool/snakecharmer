@@ -50,9 +50,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
-    DispatchMessageW, GetMessageW, GetParent, LoadCursorW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT, GWLP_WNDPROC,
+    DispatchMessageW, GetMessageW, GetParent, GetWindowTextW, LoadCursorW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    CBS_AUTOHSCROLL, CBS_DROPDOWN, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT, GWLP_WNDPROC,
     HICON, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DRAWITEM, WM_HSCROLL,
     WM_MOUSEMOVE, WM_PAINT, WM_SETFONT, WM_SETICON, WNDCLASSW, WNDPROC, WS_CHILD, WS_OVERLAPPED,
@@ -93,6 +93,7 @@ const TBM_GETPOS: u32 = 0x0400; // WM_USER + 0
 const BS_PUSHBUTTON: u32 = 0x0000_0000;
 const BS_OWNERDRAW: u32 = 0x0000_000B;
 const CBN_SELCHANGE: u16 = 1;
+const CBN_KILLFOCUS: u16 = 4;
 const BN_CLICKED: u16 = 0;
 
 // Control ids.
@@ -107,6 +108,9 @@ const ID_CB_WHEEL: u16 = 114;
 const ID_BTN_DPI_MINUS: u16 = 115;
 const ID_BTN_DPI_PLUS: u16 = 116;
 const ID_BTN_SAVE: u16 = 109;
+// On-board bind combos: id = base + index (up to MAX_ONBOARD buttons).
+const MAX_ONBOARD: u16 = 16;
+const ID_CB_ONBOARD_BASE: u16 = 300;
 // Per-zone lighting controls: id = base + zone index (up to MAX_ZONES zones).
 const MAX_ZONES: u16 = 16;
 const ID_CB_EFFECT_BASE: u16 = 200;
@@ -220,11 +224,45 @@ pub struct SettingsInit {
     pub wheel: ActionCombo,
     /// One lighting row per zone, in device order (empty = no lighting).
     pub lighting: Vec<LightingZoneInit>,
+    /// Buttons whose bind is stored on the mouse; `None` = this mouse has no
+    /// recorded keymap. On a mouse that has one, these replace the thumb-button
+    /// dropdowns.
+    pub onboard: Option<Vec<OnboardButton>>,
+}
+
+/// One button whose bind is stored in the mouse's own memory: an editable
+/// dropdown mounted at the diagram's [`CalloutSlot::Button`] with this `id`.
+/// Like [`ActionCombo`], `presets[0]` names the button and its factory bind,
+/// so the control identifies itself; other binds can be typed (`ctrl+c`).
+/// The window only carries text; the app validates it.
+pub struct OnboardButton {
+    /// The keymap button id, matching the diagram's `CalloutSlot::Button`.
+    pub id: u8,
+    /// Caption for the labeled-row fallback (no diagram slot), e.g. "Back".
+    pub label: String,
+    pub presets: Vec<String>,
+    /// What the control shows on open.
+    pub text: String,
+}
+
+/// The on-board controls still to report when Save is clicked: the ones whose
+/// text differs from what was last applied (compared trimmed), so opening and
+/// saving never writes to the mouse.
+fn onboard_changed(initial: &[String], now: &[String]) -> Vec<usize> {
+    now.iter()
+        .zip(initial)
+        .enumerate()
+        .filter(|(_, (n, i))| n.trim() != i.trim())
+        .map(|(k, _)| k)
+        .collect()
 }
 
 /// Events emitted by the window on live changes / button presses.
 /// Lighting events carry the zone's index into [`SettingsInit::lighting`].
-#[derive(Debug, Clone, Copy)]
+/// `Onboard(id, text)` is sent when an on-board control changes: at once for a
+/// picked preset, when focus leaves for typed text (and on Save for text still
+/// being typed). It carries the button id and the trimmed text.
+#[derive(Debug, Clone)]
 pub enum SettingsEvent {
     Dpi(u16),
     Polling(usize),
@@ -234,6 +272,7 @@ pub enum SettingsEvent {
     ThumbForward(usize),
     Effect(usize, usize),
     Color(usize, u8, u8, u8),
+    Onboard(u8, String),
     Save,
 }
 
@@ -262,6 +301,8 @@ struct WindowState {
     lbl_dpi: HWND,
     /// One entry per lighting zone (empty when the device has no lighting).
     swatches: Vec<Swatch>,
+    /// The on-board controls: button id, the combo, and the text it opened with.
+    onboard_edits: Vec<(u8, HWND, String)>,
     /// Owned UI font (Segoe UI 9 pt) shared by all controls.
     ui_font: HFONT,
     /// Runtime-drawn titlebar/taskbar icon (freed on `WM_DESTROY`); null if
@@ -383,6 +424,14 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
             && slot_rect(CalloutSlot::DpiDown).is_some();
         let thumb_in_diagram = slot_rect(CalloutSlot::ThumbBack).is_some()
             && slot_rect(CalloutSlot::ThumbForward).is_some();
+        // On-board buttons ride the diagram only when every one has a slot
+        // there, like lighting. On a mouse with them, back and forward are
+        // on-board buttons, so the thumb dropdowns (and their hook) give way.
+        let onboard: &[OnboardButton] = init.onboard.as_deref().unwrap_or_default();
+        let onboard = &onboard[..onboard.len().min(MAX_ONBOARD as usize)];
+        let onboard_in_diagram = !onboard.is_empty()
+            && onboard.iter().all(|b| slot_rect(CalloutSlot::Button(b.id)).is_some());
+        let show_thumbs = init.onboard.is_none();
         // Lighting rides the diagram only when EVERY zone has a slot there;
         // a partial set falls back to top-cluster rows so no zone vanishes.
         let lighting_in_diagram = !init.lighting.is_empty()
@@ -399,8 +448,11 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
         if init.dpi_buttons.is_some() && !dpi_in_diagram {
             fb_h += 2 * fb_row; // up + down fallback rows
         }
-        if !thumb_in_diagram {
+        if show_thumbs && !thumb_in_diagram {
             fb_h += 2 * fb_row + 4 + HOOK_NOTE_H; // thumb rows + hook note tucked under
+        }
+        if !onboard.is_empty() && !onboard_in_diagram {
+            fb_h += onboard.len() as i32 * fb_row;
         }
         if fb_h > 0 {
             fb_h += GROUP_GAP;
@@ -594,6 +646,21 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
             SendMessageW(cb, CB_SETCURSEL, sel, 0);
             cb
         };
+        // An editable dropdown for an on-board button: the presets plus free
+        // text, opening on the button's current text.
+        let make_onboard = |k: usize, b: &OnboardButton, x: i32, cy: i32, w: i32| -> HWND {
+            let style = (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32 | WS_TABSTOP;
+            let cb = mk("COMBOBOX", "", style, ID_CB_ONBOARD_BASE + k as u16, x, cy, w, COMBO_H + COMBO_DROP);
+            for item in &b.presets {
+                let wtxt = to_wide(item);
+                SendMessageW(cb, CB_ADDSTRING, 0, wtxt.as_ptr() as LPARAM);
+            }
+            let text = to_wide(&b.text);
+            SetWindowTextW(cb, text.as_ptr());
+            subclass_recorder(cb);
+            cb
+        };
+        let mut onboard_edits: Vec<(u8, HWND, String)> = Vec::new();
 
         // Polling row, centered (lighting gets its own centered row below —
         // both are device-wide like DPI, so they live in the top cluster;
@@ -676,7 +743,15 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
                     );
                 }
             }
-            if !thumb_in_diagram {
+            if !onboard_in_diagram {
+                for (k, b) in onboard.iter().enumerate() {
+                    let _ = mk("STATIC", &format!("{} (stored on the mouse):", b.label), 0, 0, fx, y, COL_W, LBL_H);
+                    y += LBL_H + LBL_GAP;
+                    onboard_edits.push((b.id, make_onboard(k, b, fx, y, COL_W), b.text.clone()));
+                    y += COMBO_H + GROUP_GAP;
+                }
+            }
+            if show_thumbs && !thumb_in_diagram {
                 let _ = labeled_combo(
                     "Back thumb button:",
                     ID_CB_THUMB_BACK,
@@ -707,6 +782,7 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
                 y += HOOK_NOTE_H;
             }
         }
+
         let _ = y; // cursor now == MARGIN + top_h; the pane starts below it
 
         // In-diagram dropdowns, mounted in the callouts' reserved rects and
@@ -728,9 +804,20 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
                     place(ID_CB_DOWN, CalloutSlot::DpiDown, &b.down);
                 }
             }
-            if thumb_in_diagram {
+            if show_thumbs && thumb_in_diagram {
                 place(ID_CB_THUMB_BACK, CalloutSlot::ThumbBack, &init.thumb_back);
                 place(ID_CB_THUMB_FWD, CalloutSlot::ThumbForward, &init.thumb_forward);
+            }
+            // On-board buttons, each at its own button's callout.
+            if onboard_in_diagram {
+                for (k, b) in onboard.iter().enumerate() {
+                    if let Some((cx, cy, cw, _)) = slot_rect(CalloutSlot::Button(b.id)) {
+                        let px = pane_origin.0 + (((cx - bx0) as f32) * scale).round() as i32;
+                        let py = pane_origin.1 + (((cy - by0) as f32) * scale).round() as i32;
+                        let pw = ((cw as f32) * scale).round() as i32;
+                        onboard_edits.push((b.id, make_onboard(k, b, px, py, pw), b.text.clone()));
+                    }
+                }
             }
             // The wheel dropdown is a scaffold: mounted at the wheel callout but
             // DISABLED (identity-only), so it previews a future middle-click
@@ -809,6 +896,7 @@ pub fn open(init: SettingsInit, on_event: impl Fn(SettingsEvent) + 'static) {
             tb,
             lbl_dpi,
             swatches,
+            onboard_edits,
             ui_font,
             hicon,
             pane,
@@ -900,6 +988,89 @@ unsafe extern "system" fn swatch_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     CallWindowProcW(orig, hwnd, msg, wparam, lparam)
 }
 
+/// Make an on-board combo's edit field a key recorder ([`recorder_wndproc`]),
+/// stashing its original WNDPROC the same way as [`subclass_swatch`].
+unsafe fn subclass_recorder(combo: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, SetWindowLongPtrW, GWLP_USERDATA};
+    let class = to_wide("Edit");
+    let edit = FindWindowExW(combo, std::ptr::null_mut(), class.as_ptr(), std::ptr::null());
+    if edit.is_null() {
+        return;
+    }
+    let orig = SetWindowLongPtrW(edit, GWLP_WNDPROC, recorder_wndproc as *const () as isize);
+    SetWindowLongPtrW(edit, GWLP_USERDATA, orig);
+}
+
+/// The key recorder: in an on-board bind box, pressing a key or chord writes
+/// its name ("Ctrl+Shift+T") and applies it at once, instead of typing. Bare
+/// modifiers wait for the key they modify; Alt+F4 still closes the window.
+/// Everything else goes to the original EDIT WNDPROC.
+unsafe extern "system" fn recorder_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWLP_USERDATA, WM_CHAR, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN,
+    };
+    let down = |vk: i32| GetKeyState(vk) < 0;
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wparam as u16;
+            let alt = msg == WM_SYSKEYDOWN || down(0x12);
+            if !(alt && vk == 0x73) {
+                if !crate::is_modifier(vk) {
+                    let win = down(0x5B) || down(0x5C);
+                    if let Some(name) = crate::chord_name(vk, down(0x11), down(0x10), alt, win) {
+                        let text = to_wide(&name);
+                        SetWindowTextW(hwnd, text.as_ptr());
+                        let combo = GetParent(hwnd);
+                        if let Some(st) = state_mut(GetParent(combo)) {
+                            if let Some(k) = st.onboard_edits.iter().position(|(_, h, _)| *h == combo) {
+                                apply_onboard(st, k, name);
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+        // The recorder writes the name; the characters a key would type don't.
+        WM_CHAR | WM_SYSCHAR => return 0,
+        _ => {}
+    }
+    let orig: WNDPROC = std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+}
+
+/// The text of an edit control.
+unsafe fn window_text(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+    String::from_utf16_lossy(&buf[..n.min(buf.len())])
+}
+
+/// A combo box's list entry `i` (`None` for no selection or a long entry).
+///
+/// SAFETY: `cb` is a combo box; the buffer is sized from CB_GETLBTEXTLEN.
+unsafe fn combo_item_text(cb: HWND, i: LRESULT) -> Option<String> {
+    let len = SendMessageW(cb, CB_GETLBTEXTLEN, i as WPARAM, 0);
+    if i < 0 || !(0..256).contains(&len) {
+        return None;
+    }
+    let mut buf = [0u16; 256];
+    let n = SendMessageW(cb, CB_GETLBTEXT, i as WPARAM, buf.as_mut_ptr() as LPARAM).max(0) as usize;
+    Some(String::from_utf16_lossy(&buf[..n.min(buf.len())]))
+}
+
+/// Report on-board control `k` as `text` if it differs from what was last
+/// applied, and remember it, so a focus change without an edit stays quiet.
+fn apply_onboard(st: &mut WindowState, k: usize, text: String) {
+    let (id, _, last) = &mut st.onboard_edits[k];
+    if text.trim() == last.trim() {
+        return;
+    }
+    *last = text.clone();
+    (st.on_event)(SettingsEvent::Onboard(*id, text.trim().to_string()));
+}
+
 fn snap50(v: i32) -> u16 {
     (((v + 25) / 50) * 50).clamp(0, 65535) as u16
 }
@@ -943,6 +1114,24 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let notify = hiword(wparam);
             if let Some(st) = state_mut(hwnd) {
                 match (id, notify) {
+                    // On-board controls apply live like every other control:
+                    // a picked preset at once, typed text when focus leaves.
+                    (id, CBN_SELCHANGE | CBN_KILLFOCUS)
+                        if (ID_CB_ONBOARD_BASE..ID_CB_ONBOARD_BASE + MAX_ONBOARD).contains(&id) =>
+                    {
+                        let cb = lparam as HWND;
+                        let text = if notify == CBN_SELCHANGE {
+                            // The edit text isn't updated yet during SELCHANGE.
+                            combo_item_text(cb, SendMessageW(cb, CB_GETCURSEL, 0, 0))
+                        } else {
+                            Some(window_text(cb))
+                        };
+                        if let (Some(text), Some(k)) =
+                            (text, st.onboard_edits.iter().position(|(_, h, _)| *h == cb))
+                        {
+                            apply_onboard(st, k, text);
+                        }
+                    }
                     (ID_CB_UP, CBN_SELCHANGE) => {
                         let i = SendMessageW(lparam as HWND, CB_GETCURSEL, 0, 0);
                         if i >= 0 {
@@ -1011,7 +1200,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         SetWindowTextW(st.lbl_dpi, txt.as_ptr());
                         (st.on_event)(SettingsEvent::Dpi(dpi));
                     }
-                    (ID_BTN_SAVE, BN_CLICKED) => (st.on_event)(SettingsEvent::Save),
+                    (ID_BTN_SAVE, BN_CLICKED) => {
+                        // Report the on-board fields first so the app has
+                        // validated and staged them before it writes the file.
+                        // (Normally already applied on focus loss; this
+                        // catches text still being typed when Save is hit.)
+                        let initial: Vec<String> =
+                            st.onboard_edits.iter().map(|(_, _, t)| t.clone()).collect();
+                        let now: Vec<String> =
+                            st.onboard_edits.iter().map(|(_, h, _)| window_text(*h)).collect();
+                        for k in onboard_changed(&initial, &now) {
+                            apply_onboard(st, k, now[k].clone());
+                        }
+                        (st.on_event)(SettingsEvent::Save)
+                    }
                     _ => {}
                 }
             }
@@ -1093,5 +1295,23 @@ unsafe fn choose_color(owner: HWND, initial: (u8, u8, u8)) -> Option<(u8, u8, u8
         Some(((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn onboard_save_reports_changed_controls_only() {
+        // Untouched controls stay quiet, so open + Save writes nothing; an
+        // edit, a new pick, and a control cleared since open are reported.
+        let initial = v(&["Back (default)", "ctrl+c", "Forward (default)", "disabled"]);
+        let now = v(&["Back (default)", " ctrl+c ", "Copy (Ctrl+C)", ""]);
+        assert_eq!(onboard_changed(&initial, &now), vec![2, 3]);
     }
 }
