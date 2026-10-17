@@ -54,7 +54,7 @@ directly over Win32 HID and then gets out of the way.
 | Kernel drivers | `RZCONTROL` + `RZVIRTUAL` virtual device drivers<br><sub>observed still registered after uninstalling Synapse</sub> | none (userland HID only) | **2 → 0** |
 | On-disk size | 500 MB<br><sub>Razer's published minimum</sub> | 0.61 MB (measured)<br><sub>single static exe</sub> | **~820×** |
 | Idle RAM | ~558 MB (measured) | 17 MB (measured)<br><sub>2.5 MB private working set</sub> | **~32×** |
-| Idle CPU | ≈ 1 CPU·h/day  | ≈ 0.06 CPU·h/day (measured)<br><sub>blocking HID reads, no poll loop</sub> | **~17×** |
+| Idle CPU | ≈ 1 CPU·h/day  | ≈ 0.06 CPU·h/day (measured)<br><sub>blocking HID reads; mice without DPI buttons get a small liveness read every few seconds</sub> | **~17×** |
 | Telemetry | yes | none, local-only | — |
 
 Over half a gigabyte of RAM, held permanently, to run two side buttons and a DPI setting. Yikes man
@@ -88,8 +88,8 @@ Over half a gigabyte of RAM, held permanently, to run two side buttons and a DPI
 
 Snakecharmer supports a short, deliberate list of devices, listed in the
 [supported devices table](docs/SUPPORTED-DEVICES.md). Each device is described by a small
-`DeviceSpec`, so adding another mouse is a one-file diff. It's a contained job and a good
-one to hand an AI coding agent.
+`DeviceSpec`, so adding another mouse is a small, contained diff: one new device file, a
+couple of registration lines, and a docs row. It's a good job to hand an AI coding agent.
 
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute.
 - [`CRACKING-MICE-GUIDE.md`](docs/CRACKING-MICE-GUIDE.md): how to work out a mouse's protocol.
@@ -158,6 +158,21 @@ Upgrading from a build that used `scripts\install-autostart.ps1`? Delete the lef
 (`Win+R` → `shell:startup`), or the daemon launches twice at login. That's harmless,
 since the second instance exits on the single-instance mutex, but it clutters the log.
 
+## Uninstall
+
+There is no installer, so there is nothing to run. To remove Snakecharmer completely:
+
+1. DeathAdder V3 only: if you wrote on-board binds, run `charmctl keymap reset` first.
+   The binds live in the mouse and stay there otherwise.
+2. Turn off **Start with Windows** in the tray menu (or in Task Manager → Startup apps).
+   You can also delete the `Snakecharmer` value under
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+3. Choose **Quit** from the tray menu. Quit puts the mouse back in its hardware mode.
+4. Delete `%LOCALAPPDATA%\Snakecharmer` (config, log, and the PC Vitals salt).
+5. Delete `%LOCALAPPDATA%\PCVitals\providers\snakecharmer.json`, the
+   [PC Vitals capsule](#pc-vitals-health-capsule).
+6. Delete `snakecharmer.exe` and `charmctl.exe`.
+
 ## Configuration
 
 Config lives at `%LOCALAPPDATA%\Snakecharmer\config.toml`, written with defaults on first
@@ -225,6 +240,11 @@ capture first; see [`docs/ONBOARD-KEYMAP.md`](docs/ONBOARD-KEYMAP.md).
 
 ### PC Vitals health capsule
 
+PC Vitals is a separate local app, and the capsule is how Snakecharmer reports its
+status to it. It is only a file on disk. Snakecharmer sends it nowhere and makes no network
+connections, and nothing reads it unless PC Vitals is installed. It is safe to delete; the
+daemon writes a new one at its next event.
+
 Snakecharmer writes a small status file (a "capsule") for PC Vitals at
 `%LOCALAPPDATA%\PCVitals\providers\snakecharmer.json`. It is written only on events:
 when the daemon starts, connects, loses or recovers a device session, changes polling
@@ -264,8 +284,8 @@ snakecharmer/
 ├─ crates/
 │  ├─ razer-proto/   # pure protocol: report builder, CRC, mode/DPI/RGB commands (no I/O)
 │  ├─ razer-hid/     # device open/enumerate, feature reports, input-report listener
-│  └─ platform/      # Win32: single-instance, keystroke injection, WH_MOUSE_LL hook
-├─ src/              # daemon, tray, native settings window, config, lighting
+│  └─ platform/      # Win32: single-instance, keystroke injection, WH_MOUSE_LL hook, tray, settings window
+├─ src/              # daemon, config, lighting, on-board binds, health capsule, charmctl
 └─ reference/        # runnable Python recon toolkit — worked example for cracking new devices
 ```
 
@@ -300,7 +320,7 @@ Snakecharmer's protocol knowledge (the report layout, command classes, CRC, tran
 IDs, and Chroma effect encodings) comes from
 **[OpenRazer](https://github.com/openrazer/openrazer)** (`driver/razercommon.*`,
 `razerchromacommon.c`, `razermouse_driver.c`). OpenRazer did the hard reverse-engineering;
-Snakecharmer ports the DeathAdder Elite slice of it to Windows.
+Snakecharmer ports the slice of it that covers the supported mice to Windows.
 
 That makes Snakecharmer a derivative work of OpenRazer, so it carries the same copyleft:
 the **GNU General Public License v2.0 or later**. See [`LICENSE`](LICENSE) and
@@ -314,9 +334,9 @@ Snakecharmer sends only documented Razer commands (sourced from OpenRazer). It n
 touches firmware, the bootloader, or DFU, and never fuzzes feature reports, because a bad
 write can wedge your only mouse. It never rebinds left or right click, so you can't lock
 yourself out of the mouse; the only write right click accepts is a reset to default.
-Unplugging and replugging the mouse undoes everything the daemon sets live. On-board
-binds are the exception: they stay on the mouse until you change them or run
-`charmctl keymap reset`.
+Unplugging and replugging the mouse resets driver mode and DPI. Lighting effects are sent
+with the store flag, so the mouse may keep them across a replug. On-board binds stay on the
+mouse until you change them or run `charmctl keymap reset`.
 
 Staying in userland with documented commands is deliberate. For the full argument, and
 what each level of "going deeper" would actually mean, see
@@ -327,7 +347,7 @@ what each level of "going deeper" would actually mean, see
 <details>
 <summary><b>…I unplug the mouse while Snakecharmer is running?</b></summary>
 
-The session ends and the daemon retries every 3 seconds. When a supported mouse comes
+The session ends and the daemon retries, starting at 3 seconds and backing off to 30. When a supported mouse comes
 back (the same one or a different supported model), it reconnects and re-applies your
 DPI, driver mode, and lighting automatically. You don't need to restart anything.
 </details>
@@ -338,7 +358,7 @@ DPI, driver mode, and lighting automatically. You don't need to restart anything
 Nothing is ever written to it. Snakecharmer only opens devices whose USB product id is
 in its [supported devices table](docs/SUPPORTED-DEVICES.md). Anything else, Razer or
 not, is never touched, including DeathAdder versions not yet in the table. The daemon
-just waits in its 3-second retry loop for a supported mouse to appear.
+just waits in its retry loop (3 to 30 seconds) for a supported mouse to appear.
 
 It will *name* an unsupported mouse, though. Opening Settings with one plugged in says
 which device it found and offers to open the
