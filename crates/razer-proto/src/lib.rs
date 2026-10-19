@@ -27,6 +27,7 @@
 
 pub mod devices;
 pub mod diagram;
+pub mod keymap;
 
 pub use devices::{DEATHADDER_ELITE, DEATHADDER_V3, DEATHADDER_V4_PRO, SUPPORTED};
 use diagram::Diagram;
@@ -159,7 +160,7 @@ pub mod status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeviceMode {
-    /// Factory behavior: the DPI buttons cycle DPI stages internally and send nothing.
+    /// The mouse's own behavior: the DPI buttons cycle DPI stages internally and send nothing.
     Hardware = 0x00,
     /// Driver mode: the firmware stops consuming the DPI buttons and emits vendor events.
     Driver = 0x03,
@@ -200,6 +201,10 @@ pub enum ProtoError {
     CommandEchoMismatch { sent: (u8, u8), got: (u8, u8) },
     /// A color string was not `#RRGGBB` / `RRGGBB`.
     BadColor(String),
+    /// A keymap read reply described a different button than the one asked for.
+    KeymapButtonMismatch { sent: u8, got: u8 },
+    /// A keymap write with no captured or decoded form.
+    KeymapNotWritable(String),
 }
 
 impl core::fmt::Display for ProtoError {
@@ -220,6 +225,10 @@ impl core::fmt::Display for ProtoError {
                 sent.0, sent.1, got.0, got.1
             ),
             ProtoError::BadColor(s) => write!(f, "bad color {s:?} (want #RRGGBB)"),
+            ProtoError::KeymapButtonMismatch { sent, got } => {
+                write!(f, "keymap reply for button 0x{got:02x}, asked for 0x{sent:02x}")
+            }
+            ProtoError::KeymapNotWritable(why) => write!(f, "can't write that bind: {why}"),
         }
     }
 }
@@ -603,17 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn set_dpi_report_bytes() {
-        // 1600 = 0x0640
-        let r = set_dpi_report(T, 100, 16000, 1600, 1600).unwrap();
-        assert_eq!(&r[0..8], &[0x00, 0x3F, 0x00, 0x00, 0x00, 0x07, 0x04, 0x05]);
-        // args: NOSTORE, x_hi, x_lo, y_hi, y_lo, 0, 0
-        assert_eq!(&r[8..15], &[0x00, 0x06, 0x40, 0x06, 0x40, 0x00, 0x00]);
-        // CRC self-consistency
-        assert_eq!(r[88], crc(&r));
-    }
-
-    #[test]
     fn set_dpi_asymmetric() {
         let r = set_dpi_report(T, 100, 16000, 1600, 800).unwrap();
         assert_eq!(&r[9..13], &[0x06, 0x40, 0x03, 0x20]); // 0x0640, 0x0320
@@ -624,56 +622,6 @@ mod tests {
         let r = get_dpi_report(T);
         assert_eq!(&r[0..8], &[0x00, 0x3F, 0x00, 0x00, 0x00, 0x07, 0x04, 0x85]);
         assert_eq!(r[88], crc(&r));
-    }
-
-    #[test]
-    fn dpi_range_is_enforced() {
-        // Elite range (100..=16000): reject below/above, accept the endpoints.
-        let (lo, hi) = (DEATHADDER_ELITE.dpi_min, DEATHADDER_ELITE.dpi_max);
-        assert_eq!(set_dpi_report(T, lo, hi, 50, 50), Err(ProtoError::DpiOutOfRange(50)));
-        assert_eq!(set_dpi_report(T, lo, hi, 20000, 1600), Err(ProtoError::DpiOutOfRange(20000)));
-        assert!(set_dpi_report(T, lo, hi, 100, 100).is_ok());
-        assert!(set_dpi_report(T, lo, hi, 16000, 16000).is_ok());
-    }
-
-    /// DeathAdder V3: transaction id 0x1F, and the Focus Pro sensor's 30000
-    /// ceiling permits what the Elite's range rejects.
-    #[test]
-    fn deathadder_v3_spec() {
-        let v = DEATHADDER_V3;
-        let r = set_dpi_report(v.transaction_id, v.dpi_min, v.dpi_max, 1600, 1600).unwrap();
-        assert_eq!(r[1], 0x1F, "V3 transaction id");
-        assert!(set_dpi_report(v.transaction_id, v.dpi_min, v.dpi_max, 30000, 30000).is_ok());
-        assert_eq!(
-            set_dpi_report(v.transaction_id, v.dpi_min, v.dpi_max, 30001, 30001),
-            Err(ProtoError::DpiOutOfRange(30001))
-        );
-        assert!(!v.has_rgb(), "V3 has no lighting hardware");
-        assert!(v.dpi_buttons.is_none(), "V3 has no wheel DPI buttons");
-    }
-
-    /// DeathAdder V4 Pro: transaction id `0x1F` (the OpenRazer case arm does
-    /// *not* pick up the `0x3F` group the V3's PID lands in for DPI/mode), the
-    /// Focus Pro 45K sensor's ceiling, and the V3's feature shape — no
-    /// lighting, no wheel DPI buttons. Both PIDs — wired `0x00BE` and the
-    /// wireless dongle `0x00BF` — resolve to this one spec.
-    #[test]
-    fn deathadder_v4_pro_spec() {
-        let v4 = DEATHADDER_V4_PRO;
-        let r = set_dpi_report(v4.transaction_id, v4.dpi_min, v4.dpi_max, 1600, 1600).unwrap();
-        assert_eq!(r[1], 0x1F, "V4 Pro transaction id");
-        assert!(set_dpi_report(v4.transaction_id, v4.dpi_min, v4.dpi_max, 45000, 45000).is_ok());
-        assert_eq!(
-            set_dpi_report(v4.transaction_id, v4.dpi_min, v4.dpi_max, 45001, 45001),
-            Err(ProtoError::DpiOutOfRange(45001))
-        );
-        assert!(!v4.has_rgb(), "V4 Pro has no lighting hardware");
-        assert!(v4.dpi_buttons.is_none(), "V4 Pro has no wheel DPI buttons");
-        assert_eq!(spec_for(0x00BE), Some(v4), "wired PID");
-        assert_eq!(spec_for(0x00BF), Some(v4), "wireless PID");
-        assert_eq!(spec_for(0x00B2), Some(DEATHADDER_V3), "V3 unchanged");
-        assert_eq!(spec_for(0x00BD), None, "one below the wired PID");
-        assert_eq!(spec_for(0x00C0), None, "one above the wireless PID");
     }
 
     #[test]
@@ -798,24 +746,6 @@ mod tests {
         assert_eq!(
             parse_polling_rate(PollingProtocol::Classic, &[0u8; REPORT_LEN]),
             Err(ProtoError::UnknownPollingRate(0x00))
-        );
-    }
-
-    /// Pin each device's polling capability to its OpenRazer cases
-    /// (`razer_attr_write_polling_rate` uses the classic command on the Elite,
-    /// `..._polling_rate2` on the V3).
-    #[test]
-    fn polling_specs_match_openrazer() {
-        assert_eq!(
-            DEATHADDER_ELITE.polling,
-            PollingSpec { protocol: PollingProtocol::Classic, rates: &[125, 500, 1000] }
-        );
-        assert_eq!(
-            DEATHADDER_V3.polling,
-            PollingSpec {
-                protocol: PollingProtocol::Extended,
-                rates: &[125, 500, 1000, 2000, 4000, 8000],
-            }
         );
     }
 

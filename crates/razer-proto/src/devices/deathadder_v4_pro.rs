@@ -47,3 +47,60 @@ pub const DEATHADDER_V4_PRO: DeviceSpec = DeviceSpec {
     },
     diagram: None,
 };
+
+// Per-device tests: each device file checks its own spec values. See
+// deathadder_elite.rs for the annotated model to copy.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{set_dpi_report, spec_for, ProtoError, DEATHADDER_V3};
+
+    #[test]
+    fn spec_values() {
+        let d = DEATHADDER_V4_PRO;
+        assert_eq!(d.product_ids, &[0x00BE, 0x00BF]);
+        assert_eq!(d.product_id, 0x00BE);
+        assert_eq!(d.transaction_id, 0x1F);
+        assert_eq!(d.name, "DeathAdder V4 Pro");
+        assert!(!d.has_rgb(), "V4 Pro has no lighting hardware");
+        assert!(d.dpi_buttons.is_none(), "V4 Pro has no wheel DPI buttons");
+        assert_eq!((d.dpi_min, d.dpi_max), (100, 45000));
+        assert_eq!(
+            d.polling,
+            PollingSpec {
+                protocol: PollingProtocol::Extended,
+                rates: &[125, 500, 1000, 2000, 4000, 8000],
+            }
+        );
+    }
+
+    /// Both PIDs, wired `0x00BE` and the wireless dongle `0x00BF`, resolve to
+    /// this one spec, and the neighbouring ids don't.
+    #[test]
+    fn is_registered_in_supported() {
+        assert_eq!(spec_for(0x00BE), Some(DEATHADDER_V4_PRO), "wired PID");
+        assert_eq!(spec_for(0x00BF), Some(DEATHADDER_V4_PRO), "wireless PID");
+        assert_eq!(spec_for(0x00B2), Some(DEATHADDER_V3), "V3 unchanged");
+        assert_eq!(spec_for(0x00BD), None, "one below the wired PID");
+        assert_eq!(spec_for(0x00C0), None, "one above the wireless PID");
+    }
+
+    /// Same set-DPI layout as every Razer mouse, stamped with this device's
+    /// transaction id. 1600 = 0x0640.
+    #[test]
+    fn set_dpi_report_bytes() {
+        let d = DEATHADDER_V4_PRO;
+        let r = set_dpi_report(d.transaction_id, d.dpi_min, d.dpi_max, 1600, 1600).unwrap();
+        assert_eq!(&r[0..8], &[0x00, 0x1F, 0x00, 0x00, 0x00, 0x07, 0x04, 0x05]);
+        assert_eq!(&r[8..15], &[0x00, 0x06, 0x40, 0x06, 0x40, 0x00, 0x00]);
+    }
+
+    /// The Focus Pro 45K sensor's ceiling.
+    #[test]
+    fn dpi_range_is_enforced() {
+        let (t, lo, hi) = (DEATHADDER_V4_PRO.transaction_id, 100, 45000);
+        assert!(set_dpi_report(t, lo, hi, 45000, 45000).is_ok());
+        assert_eq!(set_dpi_report(t, lo, hi, 45001, 45001), Err(ProtoError::DpiOutOfRange(45001)));
+        assert_eq!(set_dpi_report(t, lo, hi, 50, 50), Err(ProtoError::DpiOutOfRange(50)));
+    }
+}

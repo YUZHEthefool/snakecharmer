@@ -1,7 +1,7 @@
 # `reference/` — the Python recon toolkit
 
 This is the **original, runnable crack of the DeathAdder Elite in Python** — the worked
-example behind [`../CRACKING-MICE-GUIDE.md`](../CRACKING-MICE-GUIDE.md). Snakecharmer itself is
+example behind [`../docs/CRACKING-MICE-GUIDE.md`](../docs/CRACKING-MICE-GUIDE.md). Snakecharmer itself is
 the polished Rust rewrite; these ~4 small files are kept because they're the best thing to
 read (and hack on) when **adding a new device**: the whole method — enumerate → build
 report + CRC → read-confirm → write → self-logging listener — in one gulp, with no compile
@@ -39,6 +39,9 @@ keystrokes you configure (default: Ctrl+C / Ctrl+V).
 | `dpi_button_daemon.py` | The listener/injector: enables driver mode, logs every vendor code it sees, and injects the mapped keystrokes. **Edit `ACTIONS` at the top** (`"copy"`, `"paste"`, `"key:9"`, `"key:f13"`, …). A good template for a self-logging listener on any device. |
 | `set_device_mode.py` | Manual mode switch: `python set_device_mode.py driver\|hardware` (no arg = read current, safe). |
 | `set_dpi.py` | Set sensitivity directly: `python set_dpi.py 1600`. |
+| `button_listener.ps1` | Logs what every mouse button and wheel notch sends, tagged with the USB device and interface. Finds binds left in on-board memory. Read-only. |
+| `capture_session.ps1` | Guided USBPcap capture of Synapse writing button binds, one change per step. See [`../docs/ONBOARD-KEYMAP.md`](../docs/ONBOARD-KEYMAP.md). |
+| `keymap_diff.py` | Pulls Razer reports out of those captures and diffs them step by step. Standard library only; `--self-test` checks it. |
 
 ## Running it (to experiment / crack a device)
 
@@ -76,7 +79,7 @@ mirroring what OpenRazer does on Linux.
 - Left/right click, movement, wheel and the two side buttons are standard HID in both
   modes and are unaffected.
 - **Never fuzz or guess feature reports** — only send commands read out of OpenRazer (or
-  another FOSS reference). See `../CRACKING-MICE-GUIDE.md` §8 for the full safety rules.
+  another FOSS reference). See `../docs/CRACKING-MICE-GUIDE.md` §8 for the full safety rules.
 
 ## Protocol reference (as researched from OpenRazer)
 

@@ -10,7 +10,7 @@ repository = "https://github.com/asavs/snakecharmer"
 
 [package]
 name = "snakecharmer"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "A tiny native Windows replacement for Razer Synapse, with a toolkit to crack your own peripherals"
 repository = "https://github.com/asavs/snakecharmer"
@@ -30,7 +30,7 @@ serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
 
-# Footprint-focused release profile (SPEC target: static exe <= 2 MB).
+# Footprint-focused release profile: smallest static exe, no unwinding.
 [profile.release]
 opt-level = "z"
 lto = true

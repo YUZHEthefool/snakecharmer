@@ -1,0 +1,13 @@
+  5.81s  1532:00B2 IF00   mouse  XBUTTON2 (forward) down
+  6.60s  1532:00B2 IF00   mouse  XBUTTON2 (forward) down
+  7.27s  1532:00B2 IF00   mouse  XBUTTON2 (forward) down
+  8.47s  1532:00B2 IF00   mouse  XBUTTON1 (back) down
+  9.04s  1532:00B2 IF00   mouse  XBUTTON1 (back) down
+  9.57s  1532:00B2 IF00   mouse  XBUTTON1 (back) down
+ 10.64s  1532:00B2 IF00   mouse  MIDDLE (wheel click) down
+ 11.09s  1532:00B2 IF00   mouse  MIDDLE (wheel click) down
+ 11.66s  1532:00B2 IF00   mouse  MIDDLE (wheel click) down
+--- keystrokes from non-Razer devices (counted, not logged):
+  none
+--- raw mouse packets per device (movement included):
+  1532:00B2 IF00: 506
