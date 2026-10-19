@@ -96,9 +96,11 @@ instead of callouts on a picture. Drawing one is a separate, hardware-free contr
 see [`DRAWING-MICE-GUIDE.md`](DRAWING-MICE-GUIDE.md).
 
 One mouse with two USB ids: `1532:00BE` on the cable and `1532:00BF` over its wireless
-dongle. OpenRazer's per-command case arms test both PIDs together throughout
-`razermouse_driver.c`, so the two are one row, one spec, and one transaction id — how the
-mouse is attached changes where it enumerates and nothing about what it accepts.
+dongle. In `razermouse_driver.c`, every command Snakecharmer sends tests both PIDs in the
+same case arm, so the two are one row, one spec, and one transaction id. How the mouse is
+attached changes where it enumerates, not which commands it takes. If both are plugged in
+at once (charging on the cable with the dongle connected), Snakecharmer opens the wired
+one.
 
 Which of the two you are actually talking to is visible where it matters: the daemon's
 `Opened …` log line and `charmctl devices` both report the id the unit enumerated as, so a
@@ -107,7 +109,8 @@ the wired id as the model's canonical one.
 
 Like the V3 it has no lighting and no wheel DPI buttons: its DPI control is a single
 underside button that cycles onboard stages in firmware, and `razermouse_probe` creates no
-LED or `dpi_buttons` file for it in OpenRazer. What it adds over the V3 is the sensor
+lighting or `dpi_buttons` file for the mouse in OpenRazer. (The dongle has indicator LEDs of
+its own, which Snakecharmer doesn't drive.) What it adds over the V3 is the sensor
 ceiling — 45000 DPI, on the same extended polling command family, so all six rates through
 8000 Hz.
 

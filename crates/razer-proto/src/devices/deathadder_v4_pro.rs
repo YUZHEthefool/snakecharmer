@@ -9,9 +9,11 @@ use crate::{DeviceSpec, PollingProtocol, PollingSpec};
 ///
 /// Protocol per openrazer `razermouse_driver.c` / `razermouse_driver.h`:
 /// transaction_id `0x1F`, and the two PIDs sit in the same case arm of every
-/// mouse command — including `razer_attr_write_dpi`, where the V3's PID
-/// (`0x00B2`) takes the `0x3F` arm instead. So the attach method changes the
-/// USB id and nothing else, which is why both live in one spec.
+/// command Snakecharmer sends (DPI, polling, device mode, serial, firmware). So
+/// the attach method changes the USB id and nothing else Snakecharmer uses,
+/// which is why both live in one spec. OpenRazer does split them elsewhere:
+/// `read_device_type` names each one, and the dongle gets an indicator-LED
+/// file that Snakecharmer doesn't drive.
 ///
 /// The wired PID is the primary `product_id` because OpenRazer's
 /// `razer_attr_read_device_type` case names the wired model first, so the name
@@ -23,9 +25,11 @@ pub const DEATHADDER_V4_PRO: DeviceSpec = DeviceSpec {
     transaction_id: 0x1F,
     name: "DeathAdder V4 Pro",
     // `razermouse_probe` creates the attr_poll_rate/dpi/dpi_stages/charge/
-    // idle_time files and no LED file at all: the V4 Pro has no lighting
-    // hardware and no Chroma effects in OpenRazer. Lighting commands are clean
-    // no-ops (see `apply_startup_lighting`). Same shape as the V3.
+    // idle_time files and no lighting file for the mouse: the V4 Pro has no
+    // lighting hardware and no Chroma effects in OpenRazer. (The wireless
+    // dongle has its own indicator LEDs, which are out of scope.) Lighting
+    // commands are clean no-ops (see `apply_startup_lighting`). Same shape as
+    // the V3.
     rgb_zones: &[],
     // No `attr_dpi_buttons` file either, same as the V3 — the wheel-DPI vendor
     // codes are not a V4 Pro feature. Driver mode and the vendor-code listeners
@@ -34,13 +38,18 @@ pub const DEATHADDER_V4_PRO: DeviceSpec = DeviceSpec {
     dpi_min: 100,
     dpi_max: 45000,
     // `razer_chroma_misc_set_polling_rate2(polling_rate, 0x00)`, then OpenRazer
-    // repeats the identical command with argument `0x01` ("For certain devices,
-    // Razer sends each request once with 0x00 and once with 0x01"). Sending it
-    // twice is OpenRazer working around a Linux device file write that can miss
-    // the first request; we hold the handle and check the read-back, so one
-    // send is enough and that is what `set_polling_rate_report` builds. The six
-    // rates are `POLL_RATES` in the daemon's `RazerDeathAdderV4ProWired` — same
+    // repeats the command with argument `0x01` ("For certain devices, Razer
+    // sends each request once with 0x00 and once with 0x01"), mirroring what
+    // Synapse sends. What `0x01` means is unknown (OpenRazer guesses
+    // varstore). Snakecharmer sends only the `0x00` form, as it does for the
+    // V3; the read-back confirms the live rate, not that it persists. If
+    // wireless or persisted polling doesn't hold, the second send goes in as a
+    // shared-layer change covering exactly the PIDs OpenRazer lists. The six
+    // rates are `POLL_RATES` in the daemon's `RazerDeathAdderV4ProWired`, same
     // family and same rates as the V3.
+    //
+    // OpenRazer waits `RAZER_NEW_MOUSE_RECEIVER_WAIT_US` (31 ms) for this
+    // device's responses; `send_command` already sleeps 60 ms.
     polling: PollingSpec {
         protocol: PollingProtocol::Extended,
         rates: &[125, 500, 1000, 2000, 4000, 8000],

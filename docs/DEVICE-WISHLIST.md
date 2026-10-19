@@ -119,7 +119,7 @@ checking it is exactly what the golden rule forbids.
 own wireless dongle — gets one row carrying both ids, because the question this page
 answers is "which commands does this mouse take", and a dongle changes where a device
 enumerates rather than what it accepts. That is a claim you still have to check: the V4 Pro's
-two PIDs sit in the same case arm of every mouse command, but the Viper V3 Pro's two do not,
+two PIDs sit in the same case arm of every command Snakecharmer sends, but the Viper V3 Pro's two do not,
 which is why *that* pair is two rows. The pairing itself is data — `ALIAS_PIDS` at the top of
 the generator — so a model OpenRazer ships as a wired/wireless class pair gets one row only
 once someone has checked its case arms and added it there.

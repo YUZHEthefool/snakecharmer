@@ -84,13 +84,14 @@ pub struct DeviceSpec {
     /// here and shares one spec, because OpenRazer's cases for the two PIDs are
     /// identical. Extra ids are an enumeration alias, not a second protocol.
     pub product_ids: &'static [u16],
-    /// The USB product id the daemon logs and the tray names for this model.
+    /// The model's canonical USB product id, used to look up per-model data
+    /// such as its keymap.
     ///
     /// For a multi-PID device this is the id OpenRazer's `read_device_type` case
-    /// names first — the wired one, for the V4 Pro — so the string is stable
-    /// across attaches. It is *not* necessarily the id a given unit enumerated
-    /// as: code that needs that (opening the device's collections by id, say)
-    /// must take it from the bus instead.
+    /// names first — the wired one, for the V4 Pro. It is *not* necessarily the
+    /// id a given unit enumerated as: logs report the enumerated id
+    /// (`razer_hid::Mouse::product_id`), and code that opens the device's
+    /// collections by id must take the id from the bus instead.
     pub product_id: u16,
     /// transaction_id byte (offset 1 of every report); varies by model
     /// generation. Find it in the device's cases in OpenRazer's

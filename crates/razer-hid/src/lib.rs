@@ -110,16 +110,25 @@ impl Mouse {
     /// device (see [`proto::SUPPORTED`]); the matched [`DeviceSpec`] is remembered
     /// so every command is built with that model's transaction id and its
     /// features are gated correctly.
+    ///
+    /// A model with more than one id can enumerate under both at once (a V4 Pro
+    /// charging on its cable with the dongle plugged in). Then the id listed
+    /// first in [`proto::DeviceSpec::product_ids`] wins, which is the wired one: the
+    /// dongle may have no mouse on the other end.
     pub fn open_with(api: &HidApi) -> Result<Mouse> {
         let info = api
             .device_list()
-            .find(|d| {
-                d.vendor_id() == proto::VENDOR_ID
-                    && proto::spec_for(d.product_id()).is_some()
+            .filter_map(|d| {
+                let spec = proto::spec_for(d.product_id())?;
+                let rank = spec.product_ids.iter().position(|&id| id == d.product_id())?;
+                (d.vendor_id() == proto::VENDOR_ID
                     && d.interface_number() == 0
                     && d.usage_page() == 0x0001
-                    && d.usage() == 0x0002
+                    && d.usage() == 0x0002)
+                    .then_some((rank, d))
             })
+            .min_by_key(|&(rank, _)| rank) // first of equals: enumeration order otherwise
+            .map(|(_, d)| d)
             .ok_or(Error::DeviceNotFound)?;
         let spec = proto::spec_for(info.product_id()).expect("filtered on a supported product id");
         let product_id = info.product_id();

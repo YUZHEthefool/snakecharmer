@@ -62,7 +62,7 @@ shared layer, and that is a different change.
    - Register a second USB id in `ALIAS_PIDS` at the top of
      [`tools/wishlist-from-openrazer.py`](tools/wishlist-from-openrazer.py) if your model is
      *one device with two ids* — wired and through its own dongle — that OpenRazer puts in
-     the same `case` arm of every command. Otherwise it gets two rows and duplicating the
+     the same `case` arm of every command Snakecharmer sends. Otherwise it gets two rows and duplicating the
      spec file is the wrong move. If the two ids land in *different* arms (Viper V3 Pro),
      they are genuinely two rows and two specs.
 2. **Copy the closest file in `crates/razer-proto/src/devices/`** and change the values.
